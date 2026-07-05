@@ -1,0 +1,264 @@
+name: Robust OpenWrt ARMv8 Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_choice:
+        description: '选择固件源码 (Firmware Source / Codebase)'
+        required: true
+        default: 'official'
+        type: choice
+        options:
+          - 'official'     # 官方标准 OpenWrt
+          - 'immortalwrt'  # 天灵源（国内环境驱动及开箱即用体验好）
+          - 'lede'         # Lean 的 LEDE 源（更新频繁，国内常用）
+          - 'lienol'       # Lienol 的精简改版源
+      repo_branch:
+        description: '源码分支 (Branch - 官方/天灵推荐 openwrt-25.12; Lean推荐写 master)'
+        required: true
+        default: 'openwrt-25.12'
+        type: string
+      feed_choice:
+        description: '选择软件包源 (Package Feed / 决定能搜到哪些插件)'
+        required: true
+        default: 'default'
+        type: choice
+        options:
+          - 'default'      # 仅使用源码自带的 feeds
+          - 'kenzok8'      # 额外注入 Kenzok8 常用包合集源 (含有丰富特色插件)
+      firmware_format:
+        description: '固件生成格式 (Output Format)'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - 'both'         # 同时输出 LXC 容器包与 KVM 虚拟机镜像
+          - 'rootfs_only'  # 仅输出 LXC 容器包 (tar.gz)
+          - 'efi_only'     # 仅输出 KVM 虚拟机 EFI 镜像 (img.gz)
+      include_luci:
+        description: '包含 LuCI 网页后台 (Include Web UI)'
+        required: true
+        default: true
+        type: boolean
+      include_openclash:
+        description: '预装 OpenClash 插件'
+        required: true
+        default: false
+        type: boolean
+      include_passwall:
+        description: '预装 PassWall 插件'
+        required: true
+        default: false
+        type: boolean
+      custom_packages:
+        description: '输入其他自定义安装包 (空格分隔，例如: luci-app-ttyd luci-theme-argon)'
+        required: false
+        default: 'luci-theme-argon'
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    # 使用 22.04 作为编译宿主系统，比 latest (24.04) 具有更好的旧版工具链兼容性
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift
+        sudo docker image prune --all --force
+        sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+        sudo apt-get autoremove --purge -y
+        sudo apt-get clean
+        df -h
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-pyelftools qemu-utils rsync scons squashfs-tools subversion swig texinfo u-boot-tools upx-ucl unzip xmlto xz-utils zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+
+    - name: Resolve Source Repository
+      run: |
+        CHOICE="${{ github.event.inputs.repo_choice }}"
+        if [ "$CHOICE" = "official" ]; then
+          echo "REPO_URL=https://github.com/openwrt/openwrt" >> $GITHUB_ENV
+        elif [ "$CHOICE" = "immortalwrt" ]; then
+          echo "REPO_URL=https://github.com/immortalwrt/immortalwrt" >> $GITHUB_ENV
+        elif [ "$CHOICE" = "lede" ]; then
+          echo "REPO_URL=https://github.com/coolsnowwolf/lede" >> $GITHUB_ENV
+        elif [ "$CHOICE" = "lienol" ]; then
+          echo "REPO_URL=https://github.com/Lienol/openwrt" >> $GITHUB_ENV
+        fi
+        echo "REPO_BRANCH=${{ github.event.inputs.repo_branch }}" >> $GITHUB_ENV
+
+    - name: Clone source code
+      run: |
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+
+    - name: Add Third-Party Feeds Dynamically
+      run: |
+        cd openwrt
+        # 1. 如果选择了 Kenzok8 软件源，将其追加至 feeds.conf.default
+        if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ]; then
+          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git;main" >> feeds.conf.default
+          echo "src-git small https://github.com/kenzok8/small.git;main" >> feeds.conf.default
+        fi
+        
+        # 2. 如果勾选了 PassWall 且未启用 kenzok8，则单独追加 PassWall 官方源
+        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] && [ "${{ github.event.inputs.feed_choice }}" != "kenzok8" ]; then
+          echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> feeds.conf.default
+          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
+        fi
+        
+        # 3. 如果勾选了 OpenClash，拉取后精准提取包文件夹以避免目录嵌套
+        if [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
+          git clone --depth=1 https://github.com/vernesong/OpenClash.git /tmp/openclash
+          mkdir -p package/custom
+          mv /tmp/openclash/luci-app-openclash package/custom/luci-app-openclash
+          rm -rf /tmp/openclash
+        fi
+
+    - name: Load Feeds & Update
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Generate Custom Configuration File
+      run: |
+        cd openwrt
+        # 1. 基础 ARMsr-ARMv8 核心配置
+        echo "CONFIG_TARGET_armsr=y" > .config
+        echo "CONFIG_TARGET_armsr_armv8=y" >> .config
+        echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
+
+        # 2. 固件输出选项配置
+        FMT="${{ github.event.inputs.firmware_format }}"
+        if [ "$FMT" = "both" ] || [ "$FMT" = "rootfs_only" ]; then
+          echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
+        fi
+        if [ "$FMT" = "both" ] || [ "$FMT" = "efi_only" ]; then
+          echo "CONFIG_TARGET_IMAGES_GZIP=y" >> .config
+        fi
+
+        # 3. 插件包勾选配置
+        if [ "${{ github.event.inputs.include_luci }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+        fi
+        if [ "${{ github.event.inputs.include_passwall }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+        fi
+        if [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
+        fi
+
+        # 4. 规避 Dnsmasq 冲突优化
+        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
+          echo "# CONFIG_PACKAGE_dnsmasq is not set" >> .config
+          echo "CONFIG_PACKAGE_dnsmasq_full=y" >> .config
+          echo "CONFIG_PACKAGE_dnsmasq_full_dhcpv6=y" >> .config
+        fi
+
+        # 5. 健壮解析自定义追加包
+        read -r -a pkgs <<< "${{ github.event.inputs.custom_packages }}"
+        for pkg in "${pkgs[@]}"; do
+          if [ -n "$pkg" ]; then
+            echo "CONFIG_PACKAGE_$pkg=y" >> .config
+          fi
+        done
+
+        # 6. 补全默认依赖
+        make defconfig
+
+    - name: Download package
+      run: |
+        cd openwrt
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        
+        # 提取 OpenWrt 编译版本号作为 Release 的标签参考
+        grep 'CONFIG_VERSION_NUMBER' .config | cut -d'=' -f2 | tr -d '"' > .version
+        if [ ! -s .version ]; then
+          echo "custom" > .version
+        fi
+        echo "VERSION=$(cat .version)" >> $GITHUB_ENV
+
+    - name: Organize files & Rename
+      id: organize
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        if [ -d "openwrt/bin/targets/armsr/armv8" ]; then
+          cd openwrt/bin/targets/armsr/armv8
+        else
+          echo "错误：未发现编译输出目录！"
+          exit 1
+        fi
+
+        mkdir -p $GITHUB_WORKSPACE/output
+        FMT="${{ github.event.inputs.firmware_format }}"
+        
+        # 1. 重命名并导出 rootfs.tar.gz
+        if [ "$FMT" = "both" ] || [ "$FMT" = "rootfs_only" ]; then
+          ROOTFS_FILE=$(find . -maxdepth 1 -name "*rootfs.tar.gz" | head -n 1)
+          if [ -n "$ROOTFS_FILE" ]; then
+            cp "$ROOTFS_FILE" $GITHUB_WORKSPACE/output/openwrt-armsr-armv8-generic-rootfs.tar.gz
+            echo "已打包 rootfs 并重命名"
+          fi
+        fi
+        
+        # 2. 重命名并导出 EFI 虚拟机镜像 (.img.gz)
+        if [ "$FMT" = "both" ] || [ "$FMT" = "efi_only" ]; then
+          EFI_FILE=$(find . -maxdepth 1 -name "*combined-efi.img.gz" | head -n 1)
+          if [ -n "$EFI_FILE" ]; then
+            cp "$EFI_FILE" $GITHUB_WORKSPACE/output/openwrt-armsr-armv8-generic-combined-efi.img.gz
+            echo "已打包 combined-efi 镜像"
+          fi
+        fi
+        
+        if [ -z "$(ls -A $GITHUB_WORKSPACE/output)" ]; then
+          echo "错误：未找到任何目标固件文件，请检查编译日志。"
+          exit 1
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to GitHub Release
+      uses: softprops/action-gh-release@v2
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        tag_name: armsr-armv8-${{ env.VERSION }}-${{ github.run_number }}
+        name: OpenWrt ARMv8 (Run ${{ github.run_number }})
+        body: |
+          ### 构建信息 / Build Details
+          - **固件源码 (Source Code)**: `${{ github.event.inputs.repo_choice }}` (Branch: `${{ github.event.inputs.repo_branch }}`)
+          - **软件包源 (Feeds)**: `${{ github.event.inputs.feed_choice }}`
+          - **生成格式 (Format)**: `${{ github.event.inputs.firmware_format }}`
+          - **已包含插件 / Packages Included**:
+            - LuCI 网页后台: `${{ github.event.inputs.include_luci }}`
+            - OpenClash 插件: `${{ github.event.inputs.include_openclash }}`
+            - PassWall 插件: `${{ github.event.inputs.include_passwall }}`
+            - 其他自定义包: `${{ github.event.inputs.custom_packages }}`
+        files: |
+          output/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
