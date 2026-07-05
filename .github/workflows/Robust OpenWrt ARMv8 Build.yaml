@@ -10,11 +10,11 @@ on:
         type: choice
         options:
           - 'official'     # 官方标准 OpenWrt
-          - 'immortalwrt'  # 天灵源（国内环境驱动及开箱即用体验好）
-          - 'lede'         # Lean 的 LEDE 源（更新频繁，国内常用）
+          - 'immortalwrt'  # 衍生天灵源 (国内环境驱动及开箱即用体验较好)
+          - 'lede'         # Lean 的 LEDE 源 (国内极常用，插件支持全面)
           - 'lienol'       # Lienol 的精简改版源
       repo_branch:
-        description: '源码分支 (Branch - 官方/天灵推荐 openwrt-25.12; Lean推荐写 master)'
+        description: '源码分支 (Branch - 官方/天灵推荐 openwrt-25.12; Lean/Lienol 会自动纠错为对应可用分支)'
         required: true
         default: 'openwrt-25.12'
         type: string
@@ -92,16 +92,25 @@ jobs:
     - name: Resolve Source Repository
       run: |
         CHOICE="${{ github.event.inputs.repo_choice }}"
+        BRANCH="${{ github.event.inputs.repo_branch }}"
+        
         if [ "$CHOICE" = "official" ]; then
           echo "REPO_URL=https://github.com/openwrt/openwrt" >> $GITHUB_ENV
+          echo "REPO_BRANCH=$BRANCH" >> $GITHUB_ENV
         elif [ "$CHOICE" = "immortalwrt" ]; then
           echo "REPO_URL=https://github.com/immortalwrt/immortalwrt" >> $GITHUB_ENV
+          echo "REPO_BRANCH=$BRANCH" >> $GITHUB_ENV
         elif [ "$CHOICE" = "lede" ]; then
           echo "REPO_URL=https://github.com/coolsnowwolf/lede" >> $GITHUB_ENV
+          # 纠错逻辑：Lean 的 LEDE 仅支持 master 分支
+          echo "REPO_BRANCH=master" >> $GITHUB_ENV
+          echo "::warning::Lean 的 LEDE 源码仅支持 'master' 分支。已自动强制修正为 'master' 防止编译报错。"
         elif [ "$CHOICE" = "lienol" ]; then
           echo "REPO_URL=https://github.com/Lienol/openwrt" >> $GITHUB_ENV
+          # 纠错逻辑：Lienol 推荐使用 main 分支
+          echo "REPO_BRANCH=main" >> $GITHUB_ENV
+          echo "::warning::Lienol 源码推荐使用 'main' 分支。已自动强制修正为 'main' 防止编译报错。"
         fi
-        echo "REPO_BRANCH=${{ github.event.inputs.repo_branch }}" >> $GITHUB_ENV
 
     - name: Clone source code
       run: |
