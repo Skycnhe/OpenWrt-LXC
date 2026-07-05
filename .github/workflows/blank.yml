@@ -50,12 +50,27 @@ on:
         required: true
         default: false
         type: boolean
+      # 🚀 新增：自适应第三方精品插件选择项
+      include_argon:
+        description: '预装 Argon 炫酷美化主题及配置插件'
+        required: true
+        default: true
+        type: boolean
+      include_mosdns:
+        description: '预装 MosDNS 转发器 (自动匹配核心与LuCI环境分支)'
+        required: true
+        default: false
+        type: boolean
+      include_passwall_standalone:
+        description: '独立预装 PassWall 插件 (若 feed_choice 未选 kenzok8，建议勾选)'
+        required: true
+        default: false
+        type: boolean
       custom_packages:
-        description: '输入其他自定义安装包 (空格分隔，例如: luci-app-ttyd luci-theme-argon)'
+        description: '输入其他自定义安装包 (空格分隔，例如: luci-app-ttyd luci-app-upnp)'
         required: false
         default: 'luci-theme-argon'
         type: string
-      # 🚀 新增：旁路由与网络定制化控制面板
       is_bypass_router:
         description: '是否一键配置为旁路由模式 (是: 关闭DHCP/ ra通告, 设置网关及DNS)'
         required: true
@@ -109,6 +124,271 @@ jobs:
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
 
+    - name: Resolve Source Repository
+      run: |
+        CHOICE="${{ github.event.inputs.repo_choice }}"
+        BRANCH="${{ github.event.inputs.repo_branch }}"
+        
+        if [ "$CHOICE" = "official" ]; then
+          echo "REPO_URL=https://github.com/openwrt/openwrt" >> $GITHUB_ENV
+          echo "REPO_BRANCH=$BRANCH" >> $GITHUB_ENV
+        elif [ "$CHOICE" = "immortalwrt" ]; then
+          echo "REPO_URL=https://github.com/immortalwrt/immortalwrt" >> $GITHUB_ENV
+          echo "REPO_BRANCH=$BRANCH" >> $GITHUB_ENV
+        elif [ "$CHOICE" = "lede" ]; then
+          echo "REPO_URL=https://github.com/coolsnowwolf/lede" >> $GITHUB_ENV
+          echo "REPO_BRANCH=master" >> $GITHUB_ENV
+          echo "::warning::Lean 的 LEDE 源码仅支持 'master' 分支。已自动强制修正为 'master' 防止编译报错。"
+        elif [ "$CHOICE" = "lienol" ]; then
+          echo "REPO_URL=https://github.com/Lienol/openwrt" >> $GITHUB_ENV
+          echo "REPO_BRANCH=main" >> $GITHUB_ENV
+          echo "::warning::Lienol 源码推荐使用 'main' 分支。已自动强制修正为 'main' 防止编译报错。"
+        fi
+
+    - name: Clone source code
+      run: |
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+
+    - name: Add Third-Party Feeds Dynamically
+      run: |
+        cd openwrt
+        # 1. 如果选择了 Kenzok8 软件源，将其追加至 feeds.conf.default
+        if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ]; then
+          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git;main" >> feeds.conf.default
+          echo "src-git small https://github.com/kenzok8/small.git;main" >> feeds.conf.default
+        fi
+        
+        # 2. 如果勾选了 PassWall 且未启用 kenzok8，则单独追加 PassWall 官方目前最新的组织仓库源 (Openwrt-Passwall)
+        if [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] && [ "${{ github.event.inputs.feed_choice }}" != "kenzok8" ]; then
+          echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main" >> feeds.conf.default
+          echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git;main" >> feeds.conf.default
+        fi
+        
+        # 3. 如果勾选了 OpenClash，拉取后精准提取包文件夹以避免目录嵌套
+        if [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
+          git clone --depth=1 https://github.com/vernesong/OpenClash.git /tmp/openclash
+          mkdir -p package/custom
+          mv /tmp/openclash/luci-app-openclash package/custom/luci-app-openclash
+          rm -rf /tmp/openclash
+        fi
+        
+        # 4. 自动根据固件源自适应拉取 MosDNS 转发器源码 (sbwml大作)
+        if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+          # 纠错和自适应逻辑：LEDE 用 v5-lua 分支，官方/天灵用标准 v5
+          MOSDNS_BRANCH="v5"
+          if [ "${{ github.event.inputs.repo_choice }}" = "lede" ]; then
+            MOSDNS_BRANCH="v5-lua"
+          fi
+          git clone --depth=1 https://github.com/sbwml/luci-app-mosdns.git -b $MOSDNS_BRANCH /tmp/mosdns
+          mkdir -p package/custom
+          mv /tmp/mosdns/luci-app-mosdns package/custom/luci-app-mosdns
+          mv /tmp/mosdns/mosdns package/custom/mosdns
+          mv /tmp/mosdns/v2dat package/custom/v2dat
+          rm -rf /tmp/mosdns
+        fi
+        
+        # 5. 拉取 Argon 炫酷主题及其配置管理插件
+        if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
+          mkdir -p package/custom
+          git clone --depth=1 https://github.com/jerrykuku/luci-theme-argon.git package/custom/luci-theme-argon
+          git clone --depth=1 https://github.com/jerrykuku/luci-app-argon-config.git package/custom/luci-app-argon-config
+        fi
+
+    - name: Configure Default Network & Gateway Settings
+      env:
+        IS_BYPASS: ${{ github.event.inputs.is_bypass_router }}
+        LAN_IP: ${{ github.event.inputs.lan_ip }}
+        LAN_GATEWAY: ${{ github.event.inputs.lan_gateway }}
+        LAN_DNS: ${{ github.event.inputs.lan_dns }}
+      run: |
+        mkdir -p openwrt/files/etc/uci-defaults
+        cat << EOF > openwrt/files/etc/uci-defaults/99-custom-settings
+        #!/bin/sh
+        # 1. 设置 LAN 口 IP 地址
+        uci set network.lan.ipaddr='$LAN_IP'
+
+        # 2. 如果启用了旁路由模式，配置网关、DNS 并关闭其自带的 DHCP 服务
+        if [ "$IS_BYPASS" = "true" ]; then
+          # 设置上级主路由网关
+          uci set network.lan.gateway='$LAN_GATEWAY'
+          
+          # 清除原默认 DNS 并写入自定义外部 DNS
+          uci del network.lan.dns
+          for dns in $LAN_DNS; do
+            uci add_list network.lan.dns="\$dns"
+          done
+          
+          # 忽略 LAN 口的 DHCP 响应（不开启 DHCP 服务，防止内网 IP 分配冲突）
+          uci set dhcp.lan.ignore='1'
+          
+          # 禁用 IPv6 通告（防止旁路由环境下的 IPv6 分配错乱）
+          uci set dhcp.lan.ra='disabled'
+          uci set dhcp.lan.dhcpv6='disabled'
+          uci set dhcp.lan.ndp='disabled'
+        fi
+
+        # 3. 提交配置使其生效
+        uci commit network
+        uci commit dhcp
+        exit 0
+        EOF
+        # 赋予脚本执行权限
+        chmod +x openwrt/files/etc/uci-defaults/99-custom-settings
+
+    - name: Load Feeds & Update
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        
+        # 核心清理点：在 feeds update 后、install 前执行，强力擦除官方源中较旧的相关插件，防止覆盖本地自适应克隆包
+        if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+          rm -rf feeds/luci/applications/luci-app-mosdns
+          rm -rf feeds/packages/net/mosdns
+          rm -rf feeds/packages/net/v2dat
+        fi
+        if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
+          rm -rf feeds/luci/themes/luci-theme-argon
+        fi
+        
+        ./scripts/feeds install -a
+
+    - name: Generate Custom Configuration File
+      run: |
+        cd openwrt
+        # 1. 基础 ARMsr-ARMv8 核心配置
+        echo "CONFIG_TARGET_armsr=y" > .config
+        echo "CONFIG_TARGET_armsr_armv8=y" >> .config
+        echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
+
+        # 2. 固件输出选项配置
+        FMT="${{ github.event.inputs.firmware_format }}"
+        if [ "$FMT" = "both" ] || [ "$FMT" = "rootfs_only" ]; then
+          echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
+        fi
+        if [ "$FMT" = "both" ] || [ "$FMT" = "efi_only" ]; then
+          echo "CONFIG_TARGET_IMAGES_GZIP=y" >> .config
+        fi
+
+        # 3. 基础插件包配置
+        if [ "${{ github.event.inputs.include_luci }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+        fi
+        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+        fi
+        if [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
+        fi
+        
+        # 4. 动态写入自适应插件
+        if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
+        fi
+        if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
+        fi
+
+        # 5. 规避 Dnsmasq 冲突优化
+        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ] || [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+          echo "# CONFIG_PACKAGE_dnsmasq is not set" >> .config
+          echo "CONFIG_PACKAGE_dnsmasq_full=y" >> .config
+          echo "CONFIG_PACKAGE_dnsmasq_full_dhcpv6=y" >> .config
+        fi
+
+        # 6. 健壮解析自定义追加包
+        read -r -a pkgs <<< "${{ github.event.inputs.custom_packages }}"
+        for pkg in "${pkgs[@]}"; do
+          if [ -n "$pkg" ]; then
+            echo "CONFIG_PACKAGE_$pkg=y" >> .config
+          fi
+        done
+
+        # 7. 补全默认依赖
+        make defconfig
+
+    - name: Download package
+      run: |
+        cd openwrt
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        
+        # 提取 OpenWrt 编译版本号作为 Release 的标签参考
+        grep 'CONFIG_VERSION_NUMBER' .config | cut -d'=' -f2 | tr -d '"' > .version
+        if [ ! -s .version ]; then
+          echo "custom" > .version
+        fi
+        echo "VERSION=$(cat .version)" >> $GITHUB_ENV
+
+    - name: Organize files & Rename
+      id: organize
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        if [ -d "openwrt/bin/targets/armsr/armv8" ]; then
+          cd openwrt/bin/targets/armsr/armv8
+        else
+          echo "错误：未发现编译输出目录！"
+          exit 1
+        fi
+
+        mkdir -p $GITHUB_WORKSPACE/output
+        FMT="${{ github.event.inputs.firmware_format }}"
+        
+        # 1. 重命名并导出 rootfs.tar.gz
+        if [ "$FMT" = "both" ] || [ "$FMT" = "rootfs_only" ]; then
+          ROOTFS_FILE=$(find . -maxdepth 1 -name "*rootfs.tar.gz" | head -n 1)
+          if [ -n "$ROOTFS_FILE" ]; then
+            cp "$ROOTFS_FILE" $GITHUB_WORKSPACE/output/openwrt-armsr-armv8-generic-rootfs.tar.gz
+            echo "已打包 rootfs 并重命名"
+          fi
+        fi
+        
+        # 2. 重命名并导出 EFI 虚拟机镜像 (.img.gz)
+        if [ "$FMT" = "both" ] || [ "$FMT" = "efi_only" ]; then
+          EFI_FILE=$(find . -maxdepth 1 -name "*combined-efi.img.gz" | head -n 1)
+          if [ -n "$EFI_FILE" ]; then
+            cp "$EFI_FILE" $GITHUB_WORKSPACE/output/openwrt-armsr-armv8-generic-combined-efi.img.gz
+            echo "已打包 combined-efi 镜像"
+          fi
+        fi
+        
+        if [ -z "$(ls -A $GITHUB_WORKSPACE/output)" ]; then
+          echo "错误：未找到任何目标固件文件，请检查编译日志。"
+          exit 1
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to GitHub Release
+      uses: softprops/action-gh-release@v2
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        tag_name: armsr-armv8-${{ env.VERSION }}-${{ github.run_number }}
+        name: OpenWrt ARMv8 (Run ${{ github.run_number }})
+        body: |
+          ### 构建信息 / Build Details
+          - **固件源码 (Source Code)**: `${{ github.event.inputs.repo_choice }}` (Branch: `${{ github.event.inputs.repo_branch }}`)
+          - **软件包源 (Feeds)**: `${{ github.event.inputs.feed_choice }}`
+          - **生成格式 (Format)**: `${{ github.event.inputs.firmware_format }}`
+          - **已包含插件 / Packages Included**:
+            - LuCI 网页后台: `${{ github.event.inputs.include_luci }}`
+            - OpenClash 插件: `${{ github.event.inputs.include_openclash }}`
+            - PassWall 插件: `${{ github.event.inputs.include_passwall }}`
+            - Argon 炫酷主题: `${{ github.event.inputs.include_argon }}`
+            - MosDNS 转发器: `${{ github.event.inputs.include_mosdns }}`
+            - 其他自定义包: `${{ github.event.inputs.custom_packages }}`
+        files: |
+          output/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     - name: Resolve Source Repository
       run: |
         CHOICE="${{ github.event.inputs.repo_choice }}"
