@@ -58,7 +58,7 @@ on:
         required: true
         default: false
         type: boolean
-      # 🚀 新增：自适应第三方精品插件选择项
+      # 自适应第三方精品插件选择项
       include_argon:
         description: '预装 Argon 炫酷美化主题及配置插件'
         required: true
@@ -235,7 +235,15 @@ jobs:
           uci set dhcp.lan.ndp='disabled'
         fi
 
-        # 3. 提交配置使其生效
+        # 3. 强制设置 LuCI 默认界面语言为中文并设置时区为上海 (CST-8)
+        uci set luci.main.lang='zh_cn'
+        uci commit luci
+        
+        uci set system.@system[0].timezone='CST-8'
+        uci set system.@system[0].zonename='Asia/Shanghai'
+        uci commit system
+
+        # 4. 提交配置使其生效
         uci commit network
         uci commit dhcp
         exit 0
@@ -301,24 +309,32 @@ jobs:
           echo "CONFIG_TARGET_IMAGES_GZIP=y" >> .config
         fi
 
-        # 3. 基础插件包配置
+        # 3. 基础插件包及简体中文包配置
         if [ "${{ github.event.inputs.include_luci }}" = "true" ]; then
           echo "CONFIG_PACKAGE_luci=y" >> .config
+          # 注入简体中文相关的包与编译语言设定
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          echo "CONFIG_LUCI_LANG_zh-cn=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
         fi
         if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y" >> .config
         fi
         if [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y" >> .config
         fi
         
         # 4. 动态写入自适应插件
         if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn=y" >> .config
         fi
         if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=y" >> .config
         fi
 
         # 5. 规避 Dnsmasq 冲突优化 (预先声明)
@@ -366,7 +382,7 @@ jobs:
         fi
         echo "VERSION=$(cat .version)" >> $GITHUB_ENV
 
-    # 🚀 编译失败日志提取器：一旦步骤失败，直接检索 logs 并输出后 100 行报错现场，提高定位效率
+    # 编译失败日志提取器：一旦步骤失败，直接检索 logs 并输出后 100 行报错现场，提高定位效率
     - name: Print Build Failures
       if: failure()
       run: |
