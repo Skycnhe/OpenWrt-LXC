@@ -6,11 +6,12 @@ on:
       arch_choice:
         description: '选择固件架构 (Target Architecture)'
         required: true
-        default: 'arm64'
+        default: 'x86_64'
         type: choice
         options:
-          - 'arm64'       # ARM64 (ARMv8 / 树莓派、晶晨等常见多设备通用架构)
           - 'x86_64'      # X86 64位 (软路由、虚拟机、传统电脑 PC)
+          - 'arm64'       # ARM64 (armvirt/64 - 适用于传统虚拟机、LXC 容器、N1等盒子打包)
+          - 'armv8'       # ARMv8 (armsr/armv8 SystemReady - 适用于树莓派4/5、新型物理机)
       repo_choice:
         description: '选择固件源码 (Firmware Source / Codebase)'
         required: true
@@ -58,7 +59,6 @@ on:
         required: true
         default: false
         type: boolean
-      # 自适应第三方精品插件选择项
       include_argon:
         description: '预装 Argon 炫酷美化主题及配置插件'
         required: true
@@ -160,13 +160,13 @@ jobs:
     - name: Add Third-Party Feeds Dynamically
       run: |
         cd openwrt
-        # 1. 修正点：移除指定的 ;main 分支后缀，让 Git 自动识别并同步其默认主分支（master）
+        # 1. 修正：去除分叉标记后缀，保证可以无错拉取默认 master 分支
         if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ]; then
           echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git" >> feeds.conf.default
           echo "src-git small https://github.com/kenzok8/small.git" >> feeds.conf.default
         fi
         
-        # 2. 修正点：移除指定的 ;main 分支后缀，避免 PassWall 仓库默认分支变动时出错
+        # 2. 修正：同步去除 PassWall 的强制分支，防止变动报错
         if [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] && [ "${{ github.event.inputs.feed_choice }}" != "kenzok8" ]; then
           echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
           echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git" >> feeds.conf.default
@@ -182,7 +182,6 @@ jobs:
         
         # 4. 自动根据固件源自适应拉取 MosDNS 转发器源码 (sbwml大作)
         if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
-          # 纠错和自适应逻辑：LEDE 用 v5-lua 分支，官方/天灵用标准 v5
           MOSDNS_BRANCH="v5"
           if [ "${{ github.event.inputs.repo_choice }}" = "lede" ]; then
             MOSDNS_BRANCH="v5-lua"
@@ -256,7 +255,6 @@ jobs:
         cd openwrt
         ./scripts/feeds update -a
         
-        # 核心清理点：在 feeds update 后、install 前执行，强力擦除官方源中较旧的相关插件，防止覆盖本地自适应克隆包
         if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
           rm -rf feeds/luci/applications/luci-app-mosdns
           rm -rf feeds/packages/net/mosdns
@@ -264,7 +262,6 @@ jobs:
         fi
         if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
           rm -rf feeds/luci/themes/luci-theme-argon
-          # 核心修复点：LEDE 源码本身在特定目录下也带有原生的 luci-theme-argon，为防止两个同名包冲突引发报错，在此清除冲突源
           rm -rf package/lean/luci-theme-argon
         fi
         
@@ -273,31 +270,31 @@ jobs:
     - name: Generate Custom Configuration File
       run: |
         cd openwrt
-        # 1. 动态自适应核心配置 (支持 ARM64 与 X86_64 架构判定)
+        # 1. 动态自适应核心配置 (支持 X86_64, ARM64-Virt, ARMv8-SystemReady)
         ARCH="${{ github.event.inputs.arch_choice }}"
         CHOICE="${{ github.event.inputs.repo_choice }}"
         
         if [ "$ARCH" = "x86_64" ]; then
-          # X86 64位架构核心配置
+          # X86 64位架构
           echo "CONFIG_TARGET_x86=y" > .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
           echo "TARGET_DIR_NAME=x86/64" >> $GITHUB_ENV
           echo "FILE_PREFIX=openwrt-x86-64" >> $GITHUB_ENV
+        elif [ "$ARCH" = "armv8" ]; then
+          # ARMv8 SystemReady (armsr/armv8 - 适用于新内核物理设备，如树莓派4/5)
+          echo "CONFIG_TARGET_armsr=y" > .config
+          echo "CONFIG_TARGET_armsr_armv8=y" >> .config
+          echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
+          echo "TARGET_DIR_NAME=armsr/armv8" >> $GITHUB_ENV
+          echo "FILE_PREFIX=openwrt-armsr-armv8" >> $GITHUB_ENV
         else
-          # ARM64 (ARMv8) 架构核心配置
-          echo "FILE_PREFIX=openwrt-arm64" >> $GITHUB_ENV
-          if [ "$CHOICE" = "official" ] || [ "$CHOICE" = "immortalwrt" ]; then
-            echo "CONFIG_TARGET_armsr=y" > .config
-            echo "CONFIG_TARGET_armsr_armv8=y" >> .config
-            echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
-            echo "TARGET_DIR_NAME=armsr/armv8" >> $GITHUB_ENV
-          else
-            echo "CONFIG_TARGET_armvirt=y" > .config
-            echo "CONFIG_TARGET_armvirt_64=y" >> .config
-            echo "CONFIG_TARGET_armvirt_64_Default=y" >> .config
-            echo "TARGET_DIR_NAME=armvirt/64" >> $GITHUB_ENV
-          fi
+          # ARM64 Virtualization (armvirt/64 - 适用于传统虚拟机、LXC 容器及部分盒子打包模板)
+          echo "CONFIG_TARGET_armvirt=y" > .config
+          echo "CONFIG_TARGET_armvirt_64=y" >> .config
+          echo "CONFIG_TARGET_armvirt_64_Default=y" >> .config
+          echo "TARGET_DIR_NAME=armvirt/64" >> $GITHUB_ENV
+          echo "FILE_PREFIX=openwrt-armvirt-64" >> $GITHUB_ENV
         fi
 
         # 2. 固件输出选项配置
@@ -312,7 +309,6 @@ jobs:
         # 3. 基础插件包及简体中文包配置
         if [ "${{ github.event.inputs.include_luci }}" = "true" ]; then
           echo "CONFIG_PACKAGE_luci=y" >> .config
-          # 注入简体中文相关的包与编译语言设定
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
           echo "CONFIG_LUCI_LANG_zh-cn=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
@@ -337,7 +333,7 @@ jobs:
           echo "CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=y" >> .config
         fi
 
-        # 5. 规避 Dnsmasq 冲突优化 (预先声明)
+        # 5. 规避 Dnsmasq 冲突优化
         if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ] || [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
           echo "# CONFIG_PACKAGE_dnsmasq is not set" >> .config
           echo "CONFIG_PACKAGE_dnsmasq_full=y" >> .config
@@ -355,7 +351,7 @@ jobs:
         # 7. 补全默认依赖
         make defconfig
 
-        # 8. 核心去冲突修复点：在 make defconfig 运行后，强制使用 sed 二次干预移除 dnsmasq 默认包以防止其被强行还原写回
+        # 8. 强制去冲突
         if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ] || [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
           sed -i 's/CONFIG_PACKAGE_dnsmasq=y/# CONFIG_PACKAGE_dnsmasq is not set/g' .config
         fi
@@ -375,14 +371,12 @@ jobs:
         make -j$(nproc) || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
         
-        # 提取 OpenWrt 编译版本号作为 Release 的标签参考
         grep 'CONFIG_VERSION_NUMBER' .config | cut -d'=' -f2 | tr -d '"' > .version
         if [ ! -s .version ]; then
           echo "custom" > .version
         fi
         echo "VERSION=$(cat .version)" >> $GITHUB_ENV
 
-    # 编译失败日志提取器：一旦步骤失败，直接检索 logs 并输出后 100 行报错现场，提高定位效率
     - name: Print Build Failures
       if: failure()
       run: |
@@ -399,12 +393,10 @@ jobs:
       id: organize
       if: steps.compile.outputs.status == 'success'
       run: |
-        # 动态判定并进入编译目标输出目录
         TARGET_PATH="openwrt/bin/targets/${{ env.TARGET_DIR_NAME }}"
         if [ -d "$TARGET_PATH" ]; then
           cd "$TARGET_PATH"
         else
-          # 后备查找方案：如果预设目标目录异常，自动搜索 targets 下的底层子文件夹
           BACKUP_PATH=$(find openwrt/bin/targets/ -mindepth 2 -maxdepth 2 -type d | head -n 1)
           if [ -n "$BACKUP_PATH" ]; then
             cd "$BACKUP_PATH"
@@ -417,7 +409,6 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/output
         FMT="${{ github.event.inputs.firmware_format }}"
         
-        # 1. 自适应重命名并导出 rootfs.tar.gz
         if [ "$FMT" = "both" ] || [ "$FMT" = "rootfs_only" ]; then
           ROOTFS_FILE=$(find . -maxdepth 1 -name "*rootfs.tar.gz" | head -n 1)
           if [ -n "$ROOTFS_FILE" ]; then
@@ -426,9 +417,7 @@ jobs:
           fi
         fi
         
-        # 2. 自适应重命名并导出 EFI 虚拟机镜像 (.img.gz)
         if [ "$FMT" = "both" ] || [ "$FMT" = "efi_only" ]; then
-          # 兼容不同编译目标名称的通用后缀匹配规则
           EFI_FILE=$(find . -maxdepth 1 \( -name "*combined-efi.img.gz" -o -name "*combined.img.gz" -o -name "*efi.img.gz" -o -name "*ext4-combined.img.gz" \) | head -n 1)
           if [ -n "$EFI_FILE" ]; then
             cp "$EFI_FILE" $GITHUB_WORKSPACE/output/${{ env.FILE_PREFIX }}-generic-combined-efi.img.gz
