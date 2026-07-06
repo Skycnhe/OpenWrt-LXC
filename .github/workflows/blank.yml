@@ -120,7 +120,7 @@ jobs:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-pyelftools qemu-utils rsync scons squashfs-tools subversion swig texinfo u-boot-tools upx-ucl unzip xmlto xz-utils zlib1g-dev
+        sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-pyelftools qemu-utils rsync scons squashfs-tools subversion swig texinfo u-boot-tools upx-ucl unzip xmlto xz-utils zlib1g-dev python3-setuptools python3-jinja2 python3-dev
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
 
@@ -248,6 +248,8 @@ jobs:
         fi
         if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
           rm -rf feeds/luci/themes/luci-theme-argon
+          # 核心修复点：LEDE 源码本身在特定目录下也带有原生的 luci-theme-argon，为防止两个同名包冲突引发报错，在此清除冲突源
+          rm -rf package/lean/luci-theme-argon
         fi
         
         ./scripts/feeds install -a
@@ -255,10 +257,19 @@ jobs:
     - name: Generate Custom Configuration File
       run: |
         cd openwrt
-        # 1. 基础 ARMsr-ARMv8 核心配置
-        echo "CONFIG_TARGET_armsr=y" > .config
-        echo "CONFIG_TARGET_armsr_armv8=y" >> .config
-        echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
+        # 1. 动态自适应核心配置 (LEDE 与 Lienol 在 ARMv8 环境下更推荐使用传统的 armvirt/64 目标) [5.1.1, 6.1.1]
+        CHOICE="${{ github.event.inputs.repo_choice }}"
+        if [ "$CHOICE" = "official" ] || [ "$CHOICE" = "immortalwrt" ]; then
+          echo "CONFIG_TARGET_armsr=y" > .config
+          echo "CONFIG_TARGET_armsr_armv8=y" >> .config
+          echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
+          echo "TARGET_DIR_NAME=armsr/armv8" >> $GITHUB_ENV
+        else
+          echo "CONFIG_TARGET_armvirt=y" > .config
+          echo "CONFIG_TARGET_armvirt_64=y" >> .config
+          echo "CONFIG_TARGET_armvirt_64_Default=y" >> .config
+          echo "TARGET_DIR_NAME=armvirt/64" >> $GITHUB_ENV
+        fi
 
         # 2. 固件输出选项配置
         FMT="${{ github.event.inputs.firmware_format }}"
@@ -289,7 +300,7 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
         fi
 
-        # 5. 规避 Dnsmasq 冲突优化
+        # 5. 规避 Dnsmasq 冲突优化 (预先声明)
         if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ] || [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
           echo "# CONFIG_PACKAGE_dnsmasq is not set" >> .config
           echo "CONFIG_PACKAGE_dnsmasq_full=y" >> .config
@@ -306,6 +317,11 @@ jobs:
 
         # 7. 补全默认依赖
         make defconfig
+
+        # 8. 核心去冲突修复点：在 make defconfig 运行后，强制使用 sed 二次干预移除 dnsmasq 默认包以防止其被强行还原写回
+        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ] || [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+          sed -i 's/CONFIG_PACKAGE_dnsmasq=y/# CONFIG_PACKAGE_dnsmasq is not set/g' .config
+        fi
 
     - name: Download package
       run: |
@@ -329,15 +345,36 @@ jobs:
         fi
         echo "VERSION=$(cat .version)" >> $GITHUB_ENV
 
+    # 🚀 新增编译失败日志提取器：一旦步骤失败，直接检索 logs 并输出后 100 行报错现场，提高定位效率
+    - name: Print Build Failures
+      if: failure()
+      run: |
+        echo "============================================="
+        echo " 编译失败！正在尝试提取并展示最近编译错误的日志内容..."
+        echo "============================================="
+        if [ -d "openwrt/logs" ]; then
+          find openwrt/logs -type f -name "*.txt" -exec echo -e "\n--- Log File: {} ---" \; -exec tail -n 100 {} \;
+        else
+          echo "未生成 logs 文件夹，可查看上方‘Compile the firmware’步骤输出的信息。"
+        fi
+
     - name: Organize files & Rename
       id: organize
       if: steps.compile.outputs.status == 'success'
       run: |
-        if [ -d "openwrt/bin/targets/armsr/armv8" ]; then
-          cd openwrt/bin/targets/armsr/armv8
+        # 动态判定并进入编译目标输出目录
+        TARGET_PATH="openwrt/bin/targets/${{ env.TARGET_DIR_NAME }}"
+        if [ -d "$TARGET_PATH" ]; then
+          cd "$TARGET_PATH"
         else
-          echo "错误：未发现编译输出目录！"
-          exit 1
+          # 后备查找方案：如果预设目标目录异常，自动搜索 targets 下的底层子文件夹
+          BACKUP_PATH=$(find openwrt/bin/targets/ -mindepth 2 -maxdepth 2 -type d | head -n 1)
+          if [ -n "$BACKUP_PATH" ]; then
+            cd "$BACKUP_PATH"
+          else
+            echo "错误：未发现编译输出目录！"
+            exit 1
+          fi
         fi
 
         mkdir -p $GITHUB_WORKSPACE/output
@@ -354,7 +391,8 @@ jobs:
         
         # 2. 重命名并导出 EFI 虚拟机镜像 (.img.gz)
         if [ "$FMT" = "both" ] || [ "$FMT" = "efi_only" ]; then
-          EFI_FILE=$(find . -maxdepth 1 -name "*combined-efi.img.gz" | head -n 1)
+          # 兼容不同编译目标名称的通用后缀匹配规则
+          EFI_FILE=$(find . -maxdepth 1 \( -name "*combined-efi.img.gz" -o -name "*combined.img.gz" -o -name "*efi.img.gz" -o -name "*ext4-combined.img.gz" \) | head -n 1)
           if [ -n "$EFI_FILE" ]; then
             cp "$EFI_FILE" $GITHUB_WORKSPACE/output/openwrt-armsr-armv8-generic-combined-efi.img.gz
             echo "已打包 combined-efi 镜像"
