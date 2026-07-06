@@ -160,16 +160,16 @@ jobs:
     - name: Add Third-Party Feeds Dynamically
       run: |
         cd openwrt
-        # 1. 如果选择了 Kenzok8 软件源，将其追加至 feeds.conf.default
+        # 1. 修正点：移除指定的 ;main 分支后缀，让 Git 自动识别并同步其默认主分支（master）
         if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ]; then
-          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git;main" >> feeds.conf.default
-          echo "src-git small https://github.com/kenzok8/small.git;main" >> feeds.conf.default
+          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git" >> feeds.conf.default
+          echo "src-git small https://github.com/kenzok8/small.git" >> feeds.conf.default
         fi
         
-        # 2. 如果勾选了 PassWall 且未启用 kenzok8，则单独追加 PassWall 官方目前最新的组织仓库源 (Openwrt-Passwall)
+        # 2. 修正点：移除指定的 ;main 分支后缀，避免 PassWall 仓库默认分支变动时出错
         if [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] && [ "${{ github.event.inputs.feed_choice }}" != "kenzok8" ]; then
-          echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main" >> feeds.conf.default
-          echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git;main" >> feeds.conf.default
+          echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
+          echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git" >> feeds.conf.default
         fi
         
         # 3. 如果勾选了 OpenClash，拉取后精准提取包文件夹以避免目录嵌套
