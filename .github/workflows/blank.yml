@@ -23,9 +23,9 @@ on:
           - 'lede'         # Lean 的 LEDE 源 (国内极常用，插件支持全面)
           - 'lienol'       # Lienol 的精简改版源
       repo_branch:
-        description: '源码分支 (Branch - 官方/天灵推荐 openwrt-25.12; Lean/Lienol 会自动纠错为对应可用分支)'
+        description: '源码分支 (Branch - 官方/天灵推荐 openwrt-24.10; Lean/Lienol 会自动纠错为对应可用分支)'
         required: true
-        default: 'openwrt-25.12'
+        default: 'openwrt-24.10'
         type: string
       feed_choice:
         description: '选择软件包源 (Package Feed / 决定能搜到哪些插件)'
@@ -49,42 +49,26 @@ on:
         required: true
         default: true
         type: boolean
-      include_clashoo:
-        description: '预装 Clashoo 插件 (mihomo+sing-box 双内核代理)'
-        required: true
-        default: false
-        type: boolean
-      include_openclash:
-        description: '预装 OpenClash 插件'
-        required: true
-        default: false
-        type: boolean
-      include_passwall:
-        description: '预装 PassWall 插件'
-        required: true
-        default: false
-        type: boolean
-      # 自适应第三方精品插件选择项
-      include_argon:
-        description: '预装 Argon 炫酷美化主题及配置插件'
-        required: true
-        default: true
-        type: boolean
-      include_mosdns:
-        description: '预装 MosDNS 转发器 (自动匹配核心与LuCI环境分支)'
-        required: true
-        default: false
-        type: boolean
-      include_passwall_standalone:
-        description: '独立预装 PassWall 插件 (若 feed_choice 未选 kenzok8，建议勾选)'
-        required: true
-        default: false
-        type: boolean
+      plugin_choices:
+        description: '选择预装精品插件 (支持多选，空格分隔。不想要的插件直接删掉其名字即可)'
+        required: false
+        default: 'clashoo openclash passwall mosdns argon'
+        type: string
       custom_packages:
         description: '输入其他自定义安装包 (空格分隔，例如: luci-app-ttyd luci-app-upnp)'
         required: false
         default: 'luci-theme-argon'
         type: string
+      root_password:
+        description: '自定义 Root 初始密码 (Default Root Password)'
+        required: true
+        default: 'admin'
+        type: string
+      enable_cache:
+        description: '启用编译下载缓存 (利用 GitHub 缓存提升后续编译速度)'
+        required: true
+        default: true
+        type: boolean
       is_bypass_router:
         description: '是否一键配置为旁路由模式 (是: 关闭DHCP/ ra通告, 设置网关及DNS)'
         required: true
@@ -122,7 +106,8 @@ jobs:
 
     - name: Free up disk space
       run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift
+        # 深度清理磁盘，额外释放大约 20GB+ 空间，防止在大规模并发编译时耗尽空间导致崩溃
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache /usr/local/share/boost
         sudo docker image prune --all --force
         sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
         sudo apt-get autoremove --purge -y
@@ -165,29 +150,75 @@ jobs:
         cd openwrt
         
         # 🚀 核心修复：强力破除 APK 打包器对非空 CONTROL 文件夹报错拦截的限制
-        # 通过 sed 将非空报错后的 exit 1，精准替换为 rm -rf 强制清理，既能维持 APK 包构建又能确保编译不崩溃
         if [ -f include/package-pack.mk ]; then
           echo "正在应用 package-pack.mk 兼容性补丁以规避 CONTROL 校验失败报错..."
           sed -i '/is not empty! This is not right and should be checked!/{n;s/exit 1/rm -rf $$(IDIR_$(1))\/CONTROL/}' include/package-pack.mk
         fi
 
+    # 🚀 新增：利用 GitHub Cache 机制缓存源码下载目录 /dl，防止因上游下载源不稳定导致的报错并大幅度加快二次构建速度
+    - name: Cache download directory
+      if: github.event.inputs.enable_cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: openwrt/dl
+        key: ${{ github.event.inputs.repo_choice }}-${{ github.event.inputs.repo_branch }}-dl-${{ hashFiles('openwrt/feeds.conf.default') }}
+        restore-keys: |
+          ${{ github.event.inputs.repo_choice }}-${{ github.event.inputs.repo_branch }}-dl-
+
+    - name: Parse Multiselect Plugins
+      run: |
+        # 默认全部初始化为 false
+        INCLUDE_CLASHOO="false"
+        INCLUDE_OPENCLASH="false"
+        INCLUDE_PASSWALL="false"
+        INCLUDE_MOSDNS="false"
+        INCLUDE_ARGON="false"
+
+        # 读取多选字符串并按空格分割解析
+        read -r -a selected_plugins <<< "${{ github.event.inputs.plugin_choices }}"
+        for plugin in "${selected_plugins[@]}"; do
+          # 改进点：转换为小写，增强输入容错性，即使手滑输入 OpenClash / PassWall 也能被正常识别
+          plugin_lower=$(echo "$plugin" | tr '[:upper:]' '[:lower:]')
+          case "$plugin_lower" in
+            clashoo) INCLUDE_CLASHOO="true" ;;
+            openclash) INCLUDE_OPENCLASH="true" ;;
+            passwall) INCLUDE_PASSWALL="true" ;;
+            mosdns) INCLUDE_MOSDNS="true" ;;
+            argon) INCLUDE_ARGON="true" ;;
+          esac
+        done
+        
+        # 将解析后的变量保存到全局环境变量，供接下来的编译步骤读取
+        echo "INCLUDE_CLASHOO=$INCLUDE_CLASHOO" >> $GITHUB_ENV
+        echo "INCLUDE_OPENCLASH=$INCLUDE_OPENCLASH" >> $GITHUB_ENV
+        echo "INCLUDE_PASSWALL=$INCLUDE_PASSWALL" >> $GITHUB_ENV
+        echo "INCLUDE_MOSDNS=$INCLUDE_MOSDNS" >> $GITHUB_ENV
+        echo "INCLUDE_ARGON=$INCLUDE_ARGON" >> $GITHUB_ENV
+        
+        echo "解析完成！插件状态："
+        echo "Clashoo: $INCLUDE_CLASHOO"
+        echo "OpenClash: $INCLUDE_OPENCLASH"
+        echo "PassWall: $INCLUDE_PASSWALL"
+        echo "MosDNS: $INCLUDE_MOSDNS"
+        echo "Argon主题: $INCLUDE_ARGON"
+
     - name: Add Third-Party Feeds Dynamically
       run: |
         cd openwrt
-        # 1. 自动依赖绑定：若选择了 Kenzok8 源，或启用了 Clashoo 插件，强制绑定 kenzo 和 small 源（以保证 clashoo 所需依赖能在 feeds 中被解析到）
-        if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ] || [ "${{ github.event.inputs.include_clashoo }}" = "true" ]; then
+        # 1. 自动依赖绑定：若选择了 Kenzok8 源，或启用了 Clashoo 插件，强制绑定 kenzo 和 small 源
+        if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ] || [ "$INCLUDE_CLASHOO" = "true" ]; then
           echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git" >> feeds.conf.default
           echo "src-git small https://github.com/kenzok8/small.git" >> feeds.conf.default
         fi
         
-        # 2. 自动依赖绑定：如果勾选了 PassWall 相关的任一选项，且没有开启 kenzok8，系统将自动绑定 PassWall 专属源保证依赖不报未定义错误
-        if { [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ]; } && [ "${{ github.event.inputs.feed_choice }}" != "kenzok8" ]; then
+        # 2. 自动依赖绑定：如果勾选了 PassWall，且没有开启 kenzok8，系统将自动绑定 PassWall 专属源保证依赖不报未定义错误
+        if [ "$INCLUDE_PASSWALL" = "true" ] && [ "${{ github.event.inputs.feed_choice }}" != "kenzok8" ]; then
           echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
           echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git" >> feeds.conf.default
         fi
         
         # 3. 如果勾选了 OpenClash，拉取后精准提取包文件夹以避免目录嵌套
-        if [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
+        if [ "$INCLUDE_OPENCLASH" = "true" ]; then
           git clone --depth=1 https://github.com/vernesong/OpenClash.git /tmp/openclash
           mkdir -p package/custom
           mv /tmp/openclash/luci-app-openclash package/custom/luci-app-openclash
@@ -195,7 +226,7 @@ jobs:
         fi
         
         # 4. 自动根据固件源自适应拉取 MosDNS 转发器源码 (sbwml大作)
-        if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+        if [ "$INCLUDE_MOSDNS" = "true" ]; then
           # 纠错和自适应逻辑：LEDE 用 v5-lua 分支，官方/天灵用标准 v5
           MOSDNS_BRANCH="v5"
           if [ "${{ github.event.inputs.repo_choice }}" = "lede" ]; then
@@ -210,7 +241,7 @@ jobs:
         fi
         
         # 5. 拉取 Argon 炫酷主题及其配置管理插件
-        if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
+        if [ "$INCLUDE_ARGON" = "true" ]; then
           mkdir -p package/custom
           git clone --depth=1 https://github.com/jerrykuku/luci-theme-argon.git package/custom/luci-theme-argon
           git clone --depth=1 https://github.com/jerrykuku/luci-app-argon-config.git package/custom/luci-app-argon-config
@@ -222,6 +253,7 @@ jobs:
         LAN_IP: ${{ github.event.inputs.lan_ip }}
         LAN_GATEWAY: ${{ github.event.inputs.lan_gateway }}
         LAN_DNS: ${{ github.event.inputs.lan_dns }}
+        ROOT_PASSWORD: ${{ github.event.inputs.root_password }}
       run: |
         mkdir -p openwrt/files/etc/uci-defaults
         cat << EOF > openwrt/files/etc/uci-defaults/99-custom-settings
@@ -249,7 +281,21 @@ jobs:
           uci set dhcp.lan.ndp='disabled'
         fi
 
-        # 3. 强制设置 LuCI 默认界面语言为中文并设置时区为上海 (CST-8)
+        # 3. 🚀 强力网络及高并发环境调优参数（开启拥塞控制 BBR + 大幅上调连接跟踪上限限制）
+        mkdir -p /etc/sysctl.d
+        cat << 'SYS' > /etc/sysctl.d/90-network-opt.conf
+        net.ipv4.ip_forward=1
+        net.netfilter.nf_conntrack_max=65536
+        net.core.default_qdisc=fq
+        net.ipv4.tcp_congestion_control=bbr
+        SYS
+
+        # 4. 🚀 自定义并覆盖 root 初始账户密码
+        if [ -n "$ROOT_PASSWORD" ]; then
+          echo -e "$ROOT_PASSWORD\n$ROOT_PASSWORD" | passwd root
+        fi
+
+        # 5. 强制设置 LuCI 默认界面语言为中文并设置时区为上海 (CST-8)
         uci set luci.main.lang='zh_cn'
         uci commit luci
         
@@ -257,7 +303,7 @@ jobs:
         uci set system.@system[0].zonename='Asia/Shanghai'
         uci commit system
 
-        # 4. 提交配置使其生效
+        # 6. 提交配置使其生效
         uci commit network
         uci commit dhcp
         exit 0
@@ -271,12 +317,12 @@ jobs:
         ./scripts/feeds update -a
         
         # 核心清理点：在 feeds update 后、install 前执行，强力擦除官方源中较旧的相关插件，防止覆盖本地自适应克隆包
-        if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+        if [ "$INCLUDE_MOSDNS" = "true" ]; then
           rm -rf feeds/luci/applications/luci-app-mosdns
           rm -rf feeds/packages/net/mosdns
           rm -rf feeds/packages/net/v2dat
         fi
-        if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
+        if [ "$INCLUDE_ARGON" = "true" ]; then
           rm -rf feeds/luci/themes/luci-theme-argon
           # 核心修复点：LEDE 源码本身在特定目录下也带有原生的 luci-theme-argon，为防止两个同名包冲突引发报错，在此清除冲突源
           rm -rf package/lean/luci-theme-argon
@@ -298,6 +344,8 @@ jobs:
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
           echo "TARGET_DIR_NAME=x86/64" >> $GITHUB_ENV
           echo "FILE_PREFIX=openwrt-x86-64" >> $GITHUB_ENV
+          # 为 PVE LXC 部署说明准备的架构变量
+          echo "PVE_ARCH=amd64" >> $GITHUB_ENV
         elif [ "$ARCH" = "armv8" ]; then
           # ARMv8 SystemReady (armsr/armv8 - 适用于新内核物理设备，如树莓派4/5)
           echo "CONFIG_TARGET_armsr=y" > .config
@@ -305,6 +353,7 @@ jobs:
           echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
           echo "TARGET_DIR_NAME=armsr/armv8" >> $GITHUB_ENV
           echo "FILE_PREFIX=openwrt-armsr-armv8" >> $GITHUB_ENV
+          echo "PVE_ARCH=arm64" >> $GITHUB_ENV
         else
           # ARM64 Virtualization (armvirt/64 - 适用于传统虚拟机、LXC 容器及部分盒子打包模板)
           echo "CONFIG_TARGET_armvirt=y" > .config
@@ -312,6 +361,7 @@ jobs:
           echo "CONFIG_TARGET_armvirt_64_Default=y" >> .config
           echo "TARGET_DIR_NAME=armvirt/64" >> $GITHUB_ENV
           echo "FILE_PREFIX=openwrt-armvirt-64" >> $GITHUB_ENV
+          echo "PVE_ARCH=arm64" >> $GITHUB_ENV
         fi
 
         # 2. 固件输出选项配置
@@ -331,26 +381,26 @@ jobs:
           echo "CONFIG_LUCI_LANG_zh-cn=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
         fi
-        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ]; then
+        if [ "$INCLUDE_PASSWALL" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y" >> .config
         fi
-        if [ "${{ github.event.inputs.include_openclash }}" = "true" ]; then
+        if [ "$INCLUDE_OPENCLASH" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y" >> .config
         fi
         
         # 4. 动态写入自适应插件及 Clashoo 配套
-        if [ "${{ github.event.inputs.include_argon }}" = "true" ]; then
+        if [ "$INCLUDE_ARGON" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn=y" >> .config
         fi
-        if [ "${{ github.event.inputs.include_mosdns }}" = "true" ]; then
+        if [ "$INCLUDE_MOSDNS" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=y" >> .config
         fi
-        if [ "${{ github.event.inputs.include_clashoo }}" = "true" ]; then
+        if [ "$INCLUDE_CLASHOO" = "true" ]; then
           echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y" >> .config
           # 自动注入 Clashoo 所需核心依赖，防止后台缺失
@@ -364,7 +414,7 @@ jobs:
         fi
 
         # 5. 规避 Dnsmasq 冲突优化 (添加 Clashoo 作为条件)
-        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ] || [ "${{ github.event.inputs.include_mosdns }}" = "true" ] || [ "${{ github.event.inputs.include_clashoo }}" = "true" ]; then
+        if [ "$INCLUDE_PASSWALL" = "true" ] || [ "$INCLUDE_OPENCLASH" = "true" ] || [ "$INCLUDE_MOSDNS" = "true" ] || [ "$INCLUDE_CLASHOO" = "true" ]; then
           echo "# CONFIG_PACKAGE_dnsmasq is not set" >> .config
           echo "CONFIG_PACKAGE_dnsmasq_full=y" >> .config
           echo "CONFIG_PACKAGE_dnsmasq_full_dhcpv6=y" >> .config
@@ -382,8 +432,9 @@ jobs:
         make defconfig
 
         # 8. 核心去冲突修复点：在 make defconfig 运行后，强制使用 sed 二次干预移除 dnsmasq 默认包以防止其被强行还原写回
-        if [ "${{ github.event.inputs.include_passwall }}" = "true" ] || [ "${{ github.event.inputs.include_passwall_standalone }}" = "true" ] || [ "${{ github.event.inputs.include_openclash }}" = "true" ] || [ "${{ github.event.inputs.include_mosdns }}" = "true" ] || [ "${{ github.event.inputs.include_clashoo }}" = "true" ]; then
+        if [ "$INCLUDE_PASSWALL" = "true" ] || [ "$INCLUDE_OPENCLASH" = "true" ] || [ "$INCLUDE_MOSDNS" = "true" ] || [ "$INCLUDE_CLASHOO" = "true" ]; then
           sed -i 's/CONFIG_PACKAGE_dnsmasq=y/# CONFIG_PACKAGE_dnsmasq is not set/g' .config
+          sed -i 's/CONFIG_PACKAGE_dnsmasq-dhcpv6=y/# CONFIG_PACKAGE_dnsmasq-dhcpv6 is not set/g' .config
         fi
 
     - name: Download package
@@ -462,6 +513,15 @@ jobs:
         fi
         echo "status=success" >> $GITHUB_OUTPUT
 
+    # 🚀 新增本地 Artifacts 高效备份功能（一旦 Release 步骤因网络波动发生超时等异常，这里依然提供 90 天物理机固件下载保障）
+    - name: Upload artifacts to GitHub Actions
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ${{ env.FILE_PREFIX }}-firmware
+        path: output/*
+        retention-days: 90
+
     - name: Upload firmware to GitHub Release
       uses: softprops/action-gh-release@v2
       if: steps.organize.outputs.status == 'success' && !cancelled()
@@ -474,14 +534,26 @@ jobs:
           - **固件源码 (Source Code)**: `${{ github.event.inputs.repo_choice }}` (Branch: `${{ github.event.inputs.repo_branch }}`)
           - **软件包源 (Feeds)**: `${{ github.event.inputs.feed_choice }}`
           - **生成格式 (Format)**: `${{ github.event.inputs.firmware_format }}`
-          - **已包含插件 / Packages Included**:
-            - LuCI 网页后台: `${{ github.event.inputs.include_luci }}`
-            - Clashoo 插件: `${{ github.event.inputs.include_clashoo }}`
-            - OpenClash 插件: `${{ github.event.inputs.include_openclash }}`
-            - PassWall 插件: `${{ github.event.inputs.include_passwall }}`
-            - Argon 炫酷主题: `${{ github.event.inputs.include_argon }}`
-            - MosDNS 转发器: `${{ github.event.inputs.include_mosdns }}`
-            - 其他自定义包: `${{ github.event.inputs.custom_packages }}`
+          - **已包含精品插件 (Selected Plugins)**: `${{ github.event.inputs.plugin_choices }}`
+          - **其他自定义包 / Custom Packages**: `${{ github.event.inputs.custom_packages }}`
+
+          ---
+
+          ### 🚀 Proxmox VE (PVE) LXC 一键部署命令模板
+          如果您在 PVE 中部署此固件的 LXC 容器，可在 PVE Shell 控制台中直接复制以下命令进行部署（可完全避免 `sequence number 7` 启动报错）：
+          ```bash
+          pct create <您的容器ID> /var/lib/vz/template/cache/${{ env.FILE_PREFIX }}-generic-rootfs.tar.gz \
+            --arch ${{ env.PVE_ARCH }} \
+            --ostype unmanaged \
+            --unprivileged 0 \
+            --features nesting=1 \
+            --hostname openwrt \
+            --cores 1 \
+            --memory 256 \
+            --swap 0 \
+            --rootfs local-lvm:1
+          ```
+          *注：请在执行前将包上传至 PVE 模板目录，并将 `<您的容器ID>` 替换为未使用的数字（例如 `104`）*
         files: |
           output/*
       env:
