@@ -389,6 +389,11 @@ jobs:
           echo "FILE_PREFIX=openwrt-armvirt-64" >> $GITHUB_ENV
         fi
 
+        # 🚀 彻底根除 ext4 分区溢出错误：通过 .config 将物理分区大小强行上调，Boot 调至 64MB，Rootfs 上调至 1024MB（1GB）
+        # 这为 Clashoo、OpenClash、Sing-box 等编译出厂集成大型内核的固件提供了极度安全的空间包容度。
+        echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
+        echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1024" >> .config
+
         # 2. 固件输出选项配置
         FMT="${{ github.event.inputs.firmware_format }}"
         if [ "$FMT" = "both" ] || [ "$FMT" = "rootfs_only" ]; then
