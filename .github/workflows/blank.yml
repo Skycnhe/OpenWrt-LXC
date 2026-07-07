@@ -155,7 +155,7 @@ jobs:
           sed -i '/is not empty! This is not right and should be checked!/{n;s/exit 1/rm -rf $$(IDIR_$(1))\/CONTROL/}' include/package-pack.mk
         fi
 
-    # 🚀 新增：利用 GitHub Cache 机制缓存源码下载目录 /dl，防止因上游下载源不稳定导致的报错并大幅度加快二次构建速度
+    # 利用 GitHub Cache 机制缓存源码下载目录 /dl，防止因上游下载源不稳定导致的报错并大幅度加快二次构建速度
     - name: Cache download directory
       if: github.event.inputs.enable_cache == 'true'
       uses: actions/cache@v4
@@ -205,21 +205,26 @@ jobs:
     - name: Add Third-Party Feeds Dynamically
       run: |
         cd openwrt
-        # 1. 自动依赖绑定：若选择了 Kenzok8 源，或启用了 Clashoo 插件，强制绑定 kenzo 和 small 源
+        # 1. 自动依赖绑定：若选择了 Kenzok8 源，或启用了 Clashoo 插件，自动探测并绑定 kenzo 和 small 源
         if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ] || [ "$INCLUDE_CLASHOO" = "true" ]; then
-          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git" >> feeds.conf.default
-          echo "src-git small https://github.com/kenzok8/small.git" >> feeds.conf.default
+          KENZO_URL=$(resolve_git_url "https://github.com/kenzok8/openwrt-packages.git" "https://mirror.ghproxy.com/https://github.com/kenzok8/openwrt-packages.git")
+          SMALL_URL=$(resolve_git_url "https://github.com/kenzok8/small.git" "https://mirror.ghproxy.com/https://github.com/kenzok8/small.git")
+          echo "src-git kenzo $KENZO_URL" >> feeds.conf.default
+          echo "src-git small $SMALL_URL" >> feeds.conf.default
         fi
         
         # 2. 自动依赖绑定：如果勾选了 PassWall，且没有开启 kenzok8，系统将自动绑定 PassWall 专属源保证依赖不报未定义错误
         if [ "$INCLUDE_PASSWALL" = "true" ] && [ "${{ github.event.inputs.feed_choice }}" != "kenzok8" ]; then
-          echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
-          echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git" >> feeds.conf.default
+          PW_PACKAGES_URL=$(resolve_git_url "https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" "https://mirror.ghproxy.com/https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git")
+          PW_URL=$(resolve_git_url "https://github.com/Openwrt-Passwall/openwrt-passwall.git" "https://mirror.ghproxy.com/https://github.com/Openwrt-Passwall/openwrt-passwall.git")
+          echo "src-git passwall_packages $PW_PACKAGES_URL" >> feeds.conf.default
+          echo "src-git passwall $PW_URL" >> feeds.conf.default
         fi
         
-        # 3. 如果勾选了 OpenClash，拉取后精准提取包文件夹以避免目录嵌套
+        # 3. 如果勾选了 OpenClash，自动选择可用源下载并精准提取包
         if [ "$INCLUDE_OPENCLASH" = "true" ]; then
-          git clone --depth=1 https://github.com/vernesong/OpenClash.git /tmp/openclash
+          OC_URL=$(resolve_git_url "https://github.com/vernesong/OpenClash.git" "https://mirror.ghproxy.com/https://github.com/vernesong/OpenClash.git")
+          git clone --depth=1 "$OC_URL" /tmp/openclash
           mkdir -p package/custom
           mv /tmp/openclash/luci-app-openclash package/custom/luci-app-openclash
           rm -rf /tmp/openclash
@@ -232,7 +237,8 @@ jobs:
           if [ "${{ github.event.inputs.repo_choice }}" = "lede" ]; then
             MOSDNS_BRANCH="v5-lua"
           fi
-          git clone --depth=1 https://github.com/sbwml/luci-app-mosdns.git -b $MOSDNS_BRANCH /tmp/mosdns
+          MOSDNS_URL=$(resolve_git_url "https://github.com/sbwml/luci-app-mosdns.git" "https://mirror.ghproxy.com/https://github.com/sbwml/luci-app-mosdns.git")
+          git clone --depth=1 "$MOSDNS_URL" -b $MOSDNS_BRANCH /tmp/mosdns
           mkdir -p package/custom
           mv /tmp/mosdns/luci-app-mosdns package/custom/luci-app-mosdns
           mv /tmp/mosdns/mosdns package/custom/mosdns
@@ -242,9 +248,11 @@ jobs:
         
         # 5. 拉取 Argon 炫酷主题及其配置管理插件
         if [ "$INCLUDE_ARGON" = "true" ]; then
+          ARGON_URL=$(resolve_git_url "https://github.com/jerrykuku/luci-theme-argon.git" "https://mirror.ghproxy.com/https://github.com/jerrykuku/luci-theme-argon.git")
+          ARGON_CONFIG_URL=$(resolve_git_url "https://github.com/jerrykuku/luci-app-argon-config.git" "https://mirror.ghproxy.com/https://github.com/jerrykuku/luci-app-argon-config.git")
           mkdir -p package/custom
-          git clone --depth=1 https://github.com/jerrykuku/luci-theme-argon.git package/custom/luci-theme-argon
-          git clone --depth=1 https://github.com/jerrykuku/luci-app-argon-config.git package/custom/luci-app-argon-config
+          git clone --depth=1 "$ARGON_URL" package/custom/luci-theme-argon
+          git clone --depth=1 "$ARGON_CONFIG_URL" package/custom/luci-app-argon-config
         fi
 
     - name: Configure Default Network & Gateway Settings
@@ -281,7 +289,7 @@ jobs:
           uci set dhcp.lan.ndp='disabled'
         fi
 
-        # 3. 🚀 强力网络及高并发环境调优参数（开启拥塞控制 BBR + 大幅上调连接跟踪上限限制）
+        # 3. 强力网络及高并发环境调优参数（开启拥塞控制 BBR + 大幅上调连接跟踪上限限制）
         mkdir -p /etc/sysctl.d
         cat << 'SYS' > /etc/sysctl.d/90-network-opt.conf
         net.ipv4.ip_forward=1
@@ -290,7 +298,7 @@ jobs:
         net.ipv4.tcp_congestion_control=bbr
         SYS
 
-        # 4. 🚀 自定义并覆盖 root 初始账户密码
+        # 4. 自定义并覆盖 root 初始账户密码
         if [ -n "$ROOT_PASSWORD" ]; then
           echo -e "$ROOT_PASSWORD\n$ROOT_PASSWORD" | passwd root
         fi
@@ -328,6 +336,13 @@ jobs:
           rm -rf package/lean/luci-theme-argon
         fi
         
+        # 🚀 深度去冲突修复：强行移除 kenzok8/small 等源中容易引发编译失败的旧版 tcping 和 tcpping 目录，
+        # 这样 feeds 会自动回落使用官方维护的最新、兼容性更好的标准 tcping，直接避免编译报错。
+        rm -rf feeds/small/tcping
+        rm -rf feeds/kenzo/tcping
+        rm -rf feeds/small/tcpping
+        rm -rf feeds/kenzo/tcpping
+        
         ./scripts/feeds install -a
 
     - name: Generate Custom Configuration File
@@ -344,8 +359,6 @@ jobs:
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
           echo "TARGET_DIR_NAME=x86/64" >> $GITHUB_ENV
           echo "FILE_PREFIX=openwrt-x86-64" >> $GITHUB_ENV
-          # 为 PVE LXC 部署说明准备的架构变量
-          echo "PVE_ARCH=amd64" >> $GITHUB_ENV
         elif [ "$ARCH" = "armv8" ]; then
           # ARMv8 SystemReady (armsr/armv8 - 适用于新内核物理设备，如树莓派4/5)
           echo "CONFIG_TARGET_armsr=y" > .config
@@ -353,7 +366,6 @@ jobs:
           echo "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" >> .config
           echo "TARGET_DIR_NAME=armsr/armv8" >> $GITHUB_ENV
           echo "FILE_PREFIX=openwrt-armsr-armv8" >> $GITHUB_ENV
-          echo "PVE_ARCH=arm64" >> $GITHUB_ENV
         else
           # ARM64 Virtualization (armvirt/64 - 适用于传统虚拟机、LXC 容器及部分盒子打包模板)
           echo "CONFIG_TARGET_armvirt=y" > .config
@@ -361,7 +373,6 @@ jobs:
           echo "CONFIG_TARGET_armvirt_64_Default=y" >> .config
           echo "TARGET_DIR_NAME=armvirt/64" >> $GITHUB_ENV
           echo "FILE_PREFIX=openwrt-armvirt-64" >> $GITHUB_ENV
-          echo "PVE_ARCH=arm64" >> $GITHUB_ENV
         fi
 
         # 2. 固件输出选项配置
@@ -513,7 +524,7 @@ jobs:
         fi
         echo "status=success" >> $GITHUB_OUTPUT
 
-    # 🚀 新增本地 Artifacts 高效备份功能（一旦 Release 步骤因网络波动发生超时等异常，这里依然提供 90 天物理机固件下载保障）
+    # 本地 Artifacts 备份功能（一旦 Release 步骤因网络波动发生超时等异常，这里依然提供 90 天物理机固件下载保障）
     - name: Upload artifacts to GitHub Actions
       uses: actions/upload-artifact@v4
       if: steps.organize.outputs.status == 'success' && !cancelled()
@@ -536,24 +547,6 @@ jobs:
           - **生成格式 (Format)**: `${{ github.event.inputs.firmware_format }}`
           - **已包含精品插件 (Selected Plugins)**: `${{ github.event.inputs.plugin_choices }}`
           - **其他自定义包 / Custom Packages**: `${{ github.event.inputs.custom_packages }}`
-
-          ---
-
-          ### 🚀 Proxmox VE (PVE) LXC 一键部署命令模板
-          如果您在 PVE 中部署此固件的 LXC 容器，可在 PVE Shell 控制台中直接复制以下命令进行部署（可完全避免 `sequence number 7` 启动报错）：
-          ```bash
-          pct create <您的容器ID> /var/lib/vz/template/cache/${{ env.FILE_PREFIX }}-generic-rootfs.tar.gz \
-            --arch ${{ env.PVE_ARCH }} \
-            --ostype unmanaged \
-            --unprivileged 0 \
-            --features nesting=1 \
-            --hostname openwrt \
-            --cores 1 \
-            --memory 256 \
-            --swap 0 \
-            --rootfs local-lvm:1
-          ```
-          *注：请在执行前将包上传至 PVE 模板目录，并将 `<您的容器ID>` 替换为未使用的数字（例如 `104`）*
         files: |
           output/*
       env:
