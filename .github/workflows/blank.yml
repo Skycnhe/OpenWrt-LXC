@@ -177,7 +177,7 @@ jobs:
         # 读取多选字符串并按空格分割解析
         read -r -a selected_plugins <<< "${{ github.event.inputs.plugin_choices }}"
         for plugin in "${selected_plugins[@]}"; do
-          # 改进点：转换为小写，增强输入容错性，即使手滑输入 OpenClash / PassWall 也能被正常识别
+          # 转换为小写，增强输入容错性，即使手滑输入 OpenClash / PassWall 也能被正常识别
           plugin_lower=$(echo "$plugin" | tr '[:upper:]' '[:lower:]')
           case "$plugin_lower" in
             clashoo) INCLUDE_CLASHOO="true" ;;
@@ -204,7 +204,21 @@ jobs:
 
     - name: Add Third-Party Feeds Dynamically
       run: |
+        # 🚀 核心修复：定义 Git 连接状态自动检测及备用源自动切换函数（置于本 Step 的最顶端，保证全局可见）
+        resolve_git_url() {
+          local primary_url="$1"
+          local backup_url="$2"
+          # 使用 5 秒连接超时限制探测主仓库是否健康
+          if git -c net.connectTimeout=5 -c net.lowSpeedLimit=1000 -c net.lowSpeedTime=5 ls-remote --heads "$primary_url" >/dev/null 2>&1; then
+            echo "$primary_url"
+          else
+            echo "::warning::主仓库 $primary_url 连接超时，已自动无缝切换到备用源: $backup_url" >&2
+            echo "$backup_url"
+          fi
+        }
+
         cd openwrt
+
         # 1. 自动依赖绑定：若选择了 Kenzok8 源，或启用了 Clashoo 插件，自动探测并绑定 kenzo 和 small 源
         if [ "${{ github.event.inputs.feed_choice }}" = "kenzok8" ] || [ "$INCLUDE_CLASHOO" = "true" ]; then
           KENZO_URL=$(resolve_git_url "https://github.com/kenzok8/openwrt-packages.git" "https://mirror.ghproxy.com/https://github.com/kenzok8/openwrt-packages.git")
